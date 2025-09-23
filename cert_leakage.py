@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-# -*- coding: utf-8 -*-
+
 """
 Deep-dive on CMS CERT FFS data (your columns):
 ['claim_control_number','Part','DRG','HCPCS Procedure Code','Provider Type',
