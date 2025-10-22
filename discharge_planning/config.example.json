@@ -1,0 +1,18 @@
+{
+  "email": {
+    "enabled": false,
+    "from": "alerts@example.com",
+    "to": ["you@example.com", "team@example.com"],
+    "smtp_host": "smtp.gmail.com",
+    "smtp_port": 587,
+    "smtp_user": "your_email@gmail.com",
+    "smtp_password": "your_app_password"
+  },
+  "webhook": {
+    "enabled": false,
+    "url": "https://hooks.slack.com/services/YOUR/WEBHOOK/URL",
+    "headers": {
+      "Content-Type": "application/json"
+    }
+  }
+}

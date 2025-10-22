@@ -3,3 +3,5 @@
 /outputs
 outputs/
 /outputs_discharge
+/discharge_planning/__pycache__/
+/discharge_planning/*.pyc
