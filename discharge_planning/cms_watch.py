@@ -1,543 +1,187 @@
-# cms_watch.py
-# Purpose: Pull CMS NH/LTCH/IRF/HHA snippets and emit a "what's new" changelog by CCN.
-# Author: Mitch Coplan
-# Usage (example at bottom):
-#   python cms_watch.py --ccn 455682 675791 676336 --days 60
-
-import os
-import json
-import time
-import math
-import glob
-import argparse
-import datetime as dt
-from pathlib import Path
-from typing import Dict, List, Any, Optional, Tuple
-
-import requests
-import pandas as pd
+import io, sys, json, gzip, zipfile, requests, pandas as pd, datetime as dt
 from dateutil import tz
-from tenacity import retry, stop_after_attempt, wait_exponential, retry_if_exception_type
 
-# -----------------------------
-# Config: dataset IDs (CMS PDC / Socrata). These can change; override via env if needed.
-# -----------------------------
-# Nursing Home Penalties (Civil Money Penalties + DPNA)
-DATASET_PENALTIES = os.getenv("CMS_DATASET_PENALTIES", "g6vv-u9sr")
-# Nursing Home Health Deficiencies (F-tags)
-DATASET_DEFICIENCIES = os.getenv("CMS_DATASET_DEFICIENCIES", "y2hd-3m6z")
-# Nursing Home Provider Info (stars, staffing, turnover, weekend staffing, last inspection)
-DATASET_PROVIDER_INFO = os.getenv("CMS_DATASET_PROVIDER_INFO", "4pq5-n9py")
-# SNF QRP provider-level (discharge to community, readmits, MSPB-PAC, etc.)
-DATASET_SNF_QRP = os.getenv("CMS_DATASET_SNF_QRP", "v2vd-humh")  # placeholder; adjust if CMS updates
-# SNF VBP facility-level (incentive payment multiplier, rank)
-DATASET_SNF_VBP = os.getenv("CMS_DATASET_SNF_VBP", "m2qk-2p5h")  # placeholder; adjust if CMS updates
+CCNS = ["455682", "675791", "676336"]  # <- your facilities (6-digit strings)
 
-PDC_BASE = "https://data.cms.gov/resource"
-APP_TOKEN = os.getenv("CMS_PDC_APP_TOKEN")  # Strongly recommended for higher rate limits
+# -------------------------------
+# 1) Find + download latest PBJ Daily Nurse Staffing (CSV) via data.json
+# -------------------------------
+def get_latest_pbj_download_url():
+    data_json = requests.get("https://data.cms.gov/data.json", timeout=60).json()
+    for ds in data_json["dataset"]:
+        if ds.get("title","").strip().lower() == "payroll based journal daily nurse staffing":
+            # In 'distribution', the first item usually has description 'latest'
+            for dist in ds.get("distribution", []):
+                # prefer CSV (downloadURL) for simple pandas ingest
+                if dist.get("description","").lower() == "latest" and dist.get("mediaType","").startswith(("text/csv","application/zip")):
+                    # CSV usually exposed via 'downloadURL'; if missing, fall back to accessURL for the API
+                    return dist.get("downloadURL") or dist.get("accessURL")
+    raise RuntimeError("PBJ Daily Nurse Staffing 'latest' distribution not found")
 
-# Output + snapshot dirs
-SNAP_DIR = Path("data/snapshots")
-OUT_DIR = Path("outputs_watch")
-SNAP_DIR.mkdir(parents=True, exist_ok=True)
-OUT_DIR.mkdir(parents=True, exist_ok=True)
+pbj_url = get_latest_pbj_download_url()
+print("PBJ latest download:", pbj_url)
 
-# -----------------------------
-# Socrata GET helper with pagination + retries
-# -----------------------------
-class SocrataError(Exception):
-    pass
+# -------------------------------
+# 2) Load + normalize PBJ daily
+#    (The file can be CSV or ZIPped CSV; columns vary slightly; we handle common names)
+# -------------------------------
+def read_csv_maybe_zip(url):
+    resp = requests.get(url, timeout=300)
+    resp.raise_for_status()
+    content = resp.content
+    # If it's a ZIP, read the first CSV inside
+    if url.lower().endswith(".zip") or resp.headers.get("Content-Type","").startswith("application/zip"):
+        with zipfile.ZipFile(io.BytesIO(content)) as zf:
+            # pick first .csv
+            for name in zf.namelist():
+                if name.lower().endswith(".csv"):
+                    with zf.open(name) as f:
+                        return pd.read_csv(f, dtype=str, low_memory=False)
+        raise RuntimeError("ZIP has no CSV")
+    # else assume CSV
+    return pd.read_csv(io.BytesIO(content), dtype=str, low_memory=False)
 
-@retry(
-    reraise=True,
-    wait=wait_exponential(multiplier=1, min=1, max=30),
-    stop=stop_after_attempt(5),
-    retry=retry_if_exception_type(SocrataError),
-)
-def _socrata_get(dataset_id: str, params: Dict[str, Any]) -> List[Dict[str, Any]]:
-    url = f"{PDC_BASE}/{dataset_id}.json"
-    headers = {"Accept": "application/json"}
-    if APP_TOKEN:
-        headers["X-App-Token"] = APP_TOKEN
+pbj = read_csv_maybe_zip(pbj_url)
 
-    # Pagination
-    limit = params.get("$limit", 50000)
-    offset = 0
-    all_rows: List[Dict[str, Any]] = []
+# --- Map likely column names to a standard set ---
+def pick_col(df, candidates):
+    for c in candidates:
+        if c in df.columns: return c
+    return None
 
-    while True:
-        p = dict(params)
-        p["$limit"] = limit
-        p["$offset"] = offset
+COL_CCN   = pick_col(pbj, ["CMS_Certification_Number","ccn","federal_provider_number","provider_number","ProviderId"])
+COL_DATE  = pick_col(pbj, ["Work_Date","work_date","date","Date"])
+COL_RN    = pick_col(pbj, ["Hrs_RN","hrs_rn","HrsRN","RN_Hours"])
+COL_LPN   = pick_col(pbj, ["Hrs_LPN","hrs_lpn","HrsLPN","LPN_Hours"])
+COL_CNA   = pick_col(pbj, ["Hrs_CNA","hrs_cna","HrsCNA","CNA_Hours"])
+COL_TOT   = pick_col(pbj, ["Hrs_Total_Nurse_Staff","hrs_total_nurse_staff","Total_Nurse_Hours"])
+COL_CENS  = pick_col(pbj, ["Resident_Census","resident_census","Census","resident_count"])
 
-        resp = requests.get(url, headers=headers, params=p, timeout=60)
-        if resp.status_code in (429, 500, 502, 503, 504):
-            raise SocrataError(f"Transient error {resp.status_code}: {resp.text[:200]}")
-        if resp.status_code != 200:
-            raise Exception(f"Socrata request failed [{resp.status_code}]: {resp.text[:200]}")
+need = [COL_CCN, COL_DATE, COL_CENS]
+if not all(need):
+    missing = [n for n,v in zip(["CCN","DATE","CENSUS"], need) if v is None]
+    raise RuntimeError(f"PBJ: missing required columns {missing}")
 
-        rows = resp.json()
-        if not isinstance(rows, list):
-            raise Exception(f"Unexpected response format: {rows}")
+# Compute total nurse hours if not pre-aggregated
+if COL_TOT is None:
+    if not all([COL_RN, COL_LPN, COL_CNA]):
+        raise RuntimeError("PBJ: need RN/LPN/CNA hours or a total hours column")
+    pbj["total_hours"] = (
+        pd.to_numeric(pbj[COL_RN], errors="coerce").fillna(0) +
+        pd.to_numeric(pbj[COL_LPN], errors="coerce").fillna(0) +
+        pd.to_numeric(pbj[COL_CNA], errors="coerce").fillna(0)
+    )
+else:
+    pbj["total_hours"] = pd.to_numeric(pbj[COL_TOT], errors="coerce")
 
-        all_rows.extend(rows)
-        if len(rows) < limit:
-            break
-        offset += limit
-        # polite pacing
-        time.sleep(0.2)
+pbj["ccn"]  = pbj[COL_CCN].astype(str).str.zfill(6)
+pbj["date"] = pd.to_datetime(pbj[COL_DATE], errors="coerce")
+pbj["census"] = pd.to_numeric(pbj[COL_CENS], errors="coerce")
+pbj = pbj[pbj["ccn"].isin([c.zfill(6) for c in CCNS])].dropna(subset=["date","census"])
 
-    return all_rows
+# HPRD = total hours / resident count
+pbj["hprd"] = (pbj["total_hours"] / pbj["census"]).replace([pd.NA, pd.NaT], pd.NA)
 
-def _to_df(rows: List[Dict[str, Any]]) -> pd.DataFrame:
-    if not rows:
-        return pd.DataFrame()
-    df = pd.DataFrame(rows)
-    # Normalize CCN field (common variations)
-    for c in ["federal_provider_number", "ccn", "provider_number"]:
-        if c in df.columns:
-            df["ccn"] = df[c].astype(str).str.zfill(6)
-            break
-    if "ccn" not in df.columns:
-        # will be joined later by caller if needed
-        pass
-    return df
+# -------------------------------
+# 3) Build last-30 vs prior-30 windows inside the most recent dates available
+# -------------------------------
+max_date = pbj["date"].max()
+last30_start = max_date - pd.Timedelta(days=29)
+prev30_start = last30_start - pd.Timedelta(days=30)
+prev30_end   = last30_start - pd.Timedelta(days=1)
 
-# -----------------------------
-# Fetchers (by dataset)
-# -----------------------------
-def fetch_penalties(ccns: List[str], since_iso: Optional[str]) -> pd.DataFrame:
-    where_clause = f"federal_provider_number in ({','.join([repr(x) for x in ccns])})"
-    if since_iso:
-        where_clause += f" AND imposed_date >= '{since_iso}'"
-    rows = _socrata_get(DATASET_PENALTIES, {
-        "$select": "*",
-        "$where": where_clause,
-        "$limit": 50000
-    })
-    df = _to_df(rows)
-    # best-effort typing
-    for col in ["imposed_date", "collection_ended_date", "dpna_start_date", "dpna_end_date"]:
-        if col in df.columns:
-            df[col] = pd.to_datetime(df[col], errors="coerce")
-    for col in ["civil_money_penalty_amount"]:
-        if col in df.columns:
-            df[col] = pd.to_numeric(df[col], errors="coerce")
-    return df
+pbj_last30 = pbj[(pbj["date"] >= last30_start) & (pbj["date"] <= max_date)]
+pbj_prev30 = pbj[(pbj["date"] >= prev30_start) & (pbj["date"] <= prev30_end)]
 
-def fetch_deficiencies(ccns: List[str], since_iso: Optional[str]) -> pd.DataFrame:
-    where_clause = f"federal_provider_number in ({','.join([repr(x) for x in ccns])})"
-    if since_iso:
-        where_clause += f" AND inspection_date >= '{since_iso}'"
-    rows = _socrata_get(DATASET_DEFICIENCIES, {
-        "$select": "*",
-        "$where": where_clause,
-        "$limit": 50000
-    })
-    df = _to_df(rows)
-    if "inspection_date" in df.columns:
-        df["inspection_date"] = pd.to_datetime(df["inspection_date"], errors="coerce")
-    return df
+# Weekend flag
+pbj_last30["is_weekend"] = pbj_last30["date"].dt.dayofweek.isin([5,6])
 
-def fetch_provider_info(ccns: List[str]) -> pd.DataFrame:
-    rows = _socrata_get(DATASET_PROVIDER_INFO, {
-        "$select": "*",
-        "$where": f"federal_provider_number in ({','.join([repr(x) for x in ccns])})",
-        "$limit": 50000
-    })
-    df = _to_df(rows)
-    # Parse dates & numerics where common
-    if "month_year" in df.columns:
-        df["month_year"] = pd.to_datetime(df["month_year"], errors="coerce")
-    numeric_candidates = [
-        "overall_rating","staffing_rating",
-        "total_nurse_staffing_hours_per_resident_per_day",
-        "rn_staffing_hours_per_resident_per_day",
-        "weekend_total_nurse_staff_hours_per_resident_per_day",
-        "rn_turnover","total_nurse_staff_turnover","administrator_turnover"
-    ]
-    for c in numeric_candidates:
-        if c in df.columns:
-            df[c] = pd.to_numeric(df[c], errors="coerce")
-    # last inspection fields vary; keep as-is
-    return df
+def summarize_hprd(df):
+    if df.empty: return pd.Series({"hprd_mean": pd.NA})
+    return pd.Series({"hprd_mean": df["hprd"].mean(skipna=True)})
 
-def fetch_snf_qrp(ccns: List[str]) -> pd.DataFrame:
-    # QRP measure column names vary; this fetches all and we subset later
-    rows = _socrata_get(DATASET_SNF_QRP, {
-        "$select": "*",
-        "$where": f"federal_provider_number in ({','.join([repr(x) for x in ccns])})",
-        "$limit": 50000
-    })
-    df = _to_df(rows)
-    # parse numerics for common measures if present
-    for c in df.columns:
-        if c.endswith("_rate") or c.endswith("_ratio") or c.endswith("_score") or c.endswith("_percent"):
-            df[c] = pd.to_numeric(df[c], errors="coerce")
-    # date-ish fields
-    for c in ["as_of_date", "reporting_period_start_date", "reporting_period_end_date"]:
-        if c in df.columns:
-            df[c] = pd.to_datetime(df[c], errors="coerce")
-    return df
+def staffing_summary(pbj_last30, pbj_prev30):
+    # facility-level summaries
+    last30_all = pbj_last30.groupby("ccn").apply(summarize_hprd).rename(columns={"hprd_mean":"hprd_last30"})
+    prev30_all = pbj_prev30.groupby("ccn").apply(summarize_hprd).rename(columns={"hprd_mean":"hprd_prev30"})
+    # weekend vs weekday (last 30)
+    last30_weekend = pbj_last30[pbj_last30["is_weekend"]].groupby("ccn")["hprd"].mean().rename("hprd_weekend")
+    last30_weekday = pbj_last30[~pbj_last30["is_weekend"]].groupby("ccn")["hprd"].mean().rename("hprd_weekday")
 
-def fetch_snf_vbp(ccns: List[str]) -> pd.DataFrame:
-    rows = _socrata_get(DATASET_SNF_VBP, {
-        "$select": "*",
-        "$where": f"federal_provider_number in ({','.join([repr(x) for x in ccns])})",
-        "$limit": 50000
-    })
-    df = _to_df(rows)
-    for c in ["incentive_payment_multiplier","total_performance_score","achievement_score","improvement_score","rank"]:
-        if c in df.columns:
-            df[c] = pd.to_numeric(df[c], errors="coerce")
-    return df
+    out = last30_all.join(prev30_all, how="left").join(last30_weekend, how="left").join(last30_weekday, how="left")
+    # pct change last30 vs prev30
+    out["hprd_pct_change"] = (out["hprd_last30"] - out["hprd_prev30"]) / out["hprd_prev30"]
+    # weekend ratio vs weekday
+    out["weekend_ratio"] = out["hprd_weekend"] / out["hprd_weekday"]
+    return out.reset_index()
 
-# -----------------------------
-# Snapshot helpers
-# -----------------------------
-def today_str() -> str:
-    return dt.date.today().isoformat()
+staffing = staffing_summary(pbj_last30, pbj_prev30)
 
-def latest_snapshot_dir(exclude_today: bool = False) -> Optional[Path]:
-    dirs = sorted([Path(p) for p in SNAP_DIR.glob("*") if Path(p).is_dir()])
-    if not dirs:
-        return None
-    if exclude_today:
-        dirs = [d for d in dirs if d.name != today_str()]
-    return dirs[-1] if dirs else None
+# -------------------------------
+# 4) Pull turnover from Provider Information (Socrata / dataset id 4pq5-n9py)
+# -------------------------------
+def socrata_get(dataset_id, params):
+    base = f"https://data.cms.gov/resource/{dataset_id}.json"
+    r = requests.get(base, params=params, timeout=60)
+    r.raise_for_status()
+    return pd.DataFrame(r.json())
 
-def save_snapshot(frames: Dict[str, pd.DataFrame]) -> Path:
-    d = SNAP_DIR / today_str()
-    d.mkdir(parents=True, exist_ok=True)
-    for name, df in frames.items():
-        fp = d / f"{name}.parquet"
-        if df is None or df.empty:
-            # write an empty file to lock schema date
-            pd.DataFrame().to_parquet(fp, index=False)
-        else:
-            df.to_parquet(fp, index=False)
-    return d
+# Select needed fields (column names from the NH Data Dictionary)
+fields = [
+    "federal_provider_number","provider_name","city","state","month_year",
+    "rn_turnover","total_nurse_staff_turnover","administrator_turnover",
+    "weekend_total_nurse_staff_hours_per_resident_per_day"
+]
+q = {
+    "$select": ",".join(fields),
+    "$where": f"federal_provider_number in ({','.join([repr(c) for c in CCNS])})",
+    "$limit": 50000
+}
+prov = socrata_get("4pq5-n9py", q)
+if not prov.empty:
+    prov["ccn"] = prov["federal_provider_number"].astype(str).str.zfill(6)
+    prov["month_year"] = pd.to_datetime(prov["month_year"], errors="coerce")
+    for c in ["rn_turnover","total_nurse_staff_turnover","administrator_turnover",
+              "weekend_total_nurse_staff_hours_per_resident_per_day"]:
+        if c in prov.columns:
+            prov[c] = pd.to_numeric(prov[c], errors="coerce")
 
-def load_snapshot(path: Path) -> Dict[str, pd.DataFrame]:
-    out = {}
-    for pq in path.glob("*.parquet"):
-        try:
-            out[pq.stem] = pd.read_parquet(pq)
-        except Exception:
-            out[pq.stem] = pd.DataFrame()
-    return out
+    # Latest vs prior month for turnover deltas
+    prov_sorted = prov.sort_values(["ccn","month_year"])
+    latest = prov_sorted.groupby("ccn").tail(1).set_index("ccn")
+    prior  = prov_sorted.groupby("ccn").nth(-2) if prov_sorted.groupby("ccn").size().min() >= 2 else pd.DataFrame()
 
-# -----------------------------
-# Diff logic → "what's new" events
-# -----------------------------
-def _mk_event(kind: str, severity: str, text: str, data: Dict[str, Any] = None) -> Dict[str, Any]:
-    return {
-        "type": kind,         # e.g., "penalty", "deficiency", "staffing", "star", "qrp", "vbp"
-        "severity": severity, # "info" | "warn" | "high"
-        "message": text,
-        "data": data or {}
-    }
+    if not prior.empty:
+        for col in ["rn_turnover","total_nurse_staff_turnover","administrator_turnover"]:
+            latest[f"{col}_delta"] = latest[col] - prior[col]
 
-def diff_penalties(prev: pd.DataFrame, curr: pd.DataFrame, ccn: str) -> List[Dict[str, Any]]:
-    ev = []
-    p_prev = prev[prev.get("ccn","").astype(str) == ccn] if not prev.empty else pd.DataFrame()
-    p_curr = curr[curr.get("ccn","").astype(str) == ccn] if not curr.empty else pd.DataFrame()
-    if p_curr.empty and p_prev.empty:
-        return ev
+    turnover = latest.reset_index()[["ccn","rn_turnover","total_nurse_staff_turnover","administrator_turnover",
+                                     "rn_turnover_delta","total_nurse_staff_turnover_delta","administrator_turnover_delta"]]
+else:
+    turnover = pd.DataFrame(columns=["ccn"])
 
-    # Identify NEW penalties by (imposed_date, CMP amount, dpna_start_date)
-    key_cols = ["imposed_date","civil_money_penalty_amount","dpna_start_date","dpna_end_date"]
-    def _key(df):
-        for col in key_cols:
-            if col not in df.columns:
-                df[col] = pd.NaT if "date" in col else pd.NA
-        return df[key_cols].astype(str).agg("|".join, axis=1)
+# -------------------------------
+# 5) Merge + flag your three signals
+# -------------------------------
+out = staffing.merge(turnover, on="ccn", how="left")
 
-    prev_keys = set(_key(p_prev)) if not p_prev.empty else set()
-    for _, row in p_curr.iterrows():
-        k = "|".join([
-            str(row.get("imposed_date","")),
-            str(row.get("civil_money_penalty_amount","")),
-            str(row.get("dpna_start_date","")),
-            str(row.get("dpna_end_date","")),
-        ])
-        if k not in prev_keys:
-            amt = row.get("civil_money_penalty_amount", None)
-            dpna_start = row.get("dpna_start_date", None)
-            dpna_end = row.get("dpna_end_date", None)
-            if pd.notna(amt) and float(amt) > 0:
-                ev.append(_mk_event("penalty", "high",
-                                    f"New CMP imposed: ${float(amt):,.0f} (imposed {str(row.get('imposed_date'))[:10]})",
-                                    {"amount": amt}))
-            if pd.notna(dpna_start) and (pd.isna(dpna_end) or str(dpna_end) == "" or pd.to_datetime(dpna_end, errors="coerce") > dt.datetime.now()):
-                ev.append(_mk_event("penalty", "high",
-                                    f"DPNA active or newly started ({str(dpna_start)[:10]} → {str(dpna_end)[:10] if pd.notna(dpna_end) else 'ongoing'})",
-                                    {"dpna_start": str(dpna_start), "dpna_end": str(dpna_end)}))
-    return ev
+def flag(row):
+    notes = []
+    # A) HPRD drop ≥ 10%
+    if pd.notna(row.get("hprd_pct_change", pd.NA)) and row["hprd_pct_change"] <= -0.10:
+        notes.append(f"HPRD fell ≥10%: {row['hprd_prev30']:.2f}→{row['hprd_last30']:.2f}")
+    # B) Weekend staffing < 80% of weekday
+    if pd.notna(row.get("weekend_ratio", pd.NA)) and row["weekend_ratio"] < 0.80:
+        notes.append(f"Weekend staffing low: {row['weekend_ratio']:.0%} of weekday")
+    # C) Turnover increases ≥5 percentage points (month over month)
+    for col,label in [("rn_turnover_delta","RN"),("total_nurse_staff_turnover_delta","Nurse"),("administrator_turnover_delta","Admin")]:
+        val = row.get(col, None)
+        if val is not None and pd.notna(val) and val >= 0.05:
+            notes.append(f"{label} turnover +{val*100:.0f} pp m/m")
+    return "; ".join(notes) if notes else ""
 
-def diff_deficiencies(prev: pd.DataFrame, curr: pd.DataFrame, ccn: str) -> List[Dict[str, Any]]:
-    ev = []
-    d_prev = prev[prev.get("ccn","").astype(str) == ccn] if not prev.empty else pd.DataFrame()
-    d_curr = curr[curr.get("ccn","").astype(str) == ccn] if not curr.empty else pd.DataFrame()
-    if d_curr.empty:
-        return ev
-    # New rows since last snapshot (by tag + inspection_date)
-    def _key(df):
-        cols = ["deficiency_tag","inspection_date","scope_and_severity"]
-        for c in cols:
-            if c not in df.columns:
-                df[c] = pd.NA
-        return df[cols].astype(str).agg("|".join, axis=1)
+out["staffing_alerts"] = out.apply(flag, axis=1)
 
-    prev_keys = set(_key(d_prev)) if not d_prev.empty else set()
-    for _, r in d_curr.iterrows():
-        k = "|".join([str(r.get("deficiency_tag","")), str(r.get("inspection_date","")), str(r.get("scope_and_severity",""))])
-        if k not in prev_keys:
-            sev = str(r.get("scope_and_severity","")).upper()
-            tag = str(r.get("deficiency_tag",""))
-            date = str(r.get("inspection_date",""))[:10]
-            msg = f"New deficiency {tag} ({sev}) on {date}"
-            ev.append(_mk_event("deficiency", "high" if sev in {"J","K","L"} else "warn", msg, {
-                "tag": tag, "scope_severity": sev, "date": date
-            }))
-    return ev
-
-def diff_provider_info(prev: pd.DataFrame, curr: pd.DataFrame, ccn: str) -> List[Dict[str, Any]]:
-    ev = []
-    p_prev = prev[prev.get("ccn","").astype(str) == ccn] if not prev.empty else pd.DataFrame()
-    p_curr = curr[curr.get("ccn","").astype(str) == ccn] if not curr.empty else pd.DataFrame()
-    if p_curr.empty:
-        return ev
-
-    # Take latest month_year for each snapshot
-    def latest_row(df: pd.DataFrame) -> Optional[pd.Series]:
-        if df.empty:
-            return None
-        if "month_year" in df.columns:
-            df = df.sort_values("month_year")
-            return df.iloc[-1]
-        return df.iloc[-1]
-
-    r_prev = latest_row(p_prev)
-    r_curr = latest_row(p_curr)
-
-    def _get(s: Optional[pd.Series], col: str, default=None):
-        if s is None:
-            return default
-        return s.get(col, default)
-
-    # Star changes
-    for col, label in [
-        ("overall_rating","Overall star"),
-        ("staffing_rating","Staffing star"),
-    ]:
-        old = _get(r_prev, col)
-        new = _get(r_curr, col)
-        if pd.notna(new) and (pd.isna(old) or new != old):
-            delta = (None if pd.isna(old) else new - old)
-            msg = f"{label} {'changed' if pd.notna(delta) else 'reported'}: {old} → {new}"
-            sev = "warn" if (label == "Overall star" and pd.notna(delta) and delta < 0) else "info"
-            ev.append(_mk_event("star", sev, msg, {"from": old, "to": new}))
-
-    # Staffing signal thresholds
-    def pct_change(a, b):
-        try:
-            return (b - a) / a if a not in (None, 0, pd.NA, pd.NaT) and pd.notna(a) else math.inf
-        except Exception:
-            return math.inf
-
-    # HPRD drop ≥10%
-    hprd_prev = _get(r_prev, "total_nurse_staffing_hours_per_resident_per_day")
-    hprd_curr = _get(r_curr, "total_nurse_staffing_hours_per_resident_per_day")
-    if pd.notna(hprd_prev) and pd.notna(hprd_curr):
-        chg = pct_change(hprd_prev, hprd_curr)
-        if chg <= -0.10:
-            ev.append(_mk_event("staffing", "warn",
-                                f"Total nurse HPRD fell ≥10%: {hprd_prev:.2f} → {hprd_curr:.2f}",
-                                {"from": hprd_prev, "to": hprd_curr}))
-
-    # Weekend staffing dip vs weekday proxy (simple heuristic if present)
-    wknd_prev = _get(r_prev, "weekend_total_nurse_staff_hours_per_resident_per_day")
-    wknd_curr = _get(r_curr, "weekend_total_nurse_staff_hours_per_resident_per_day")
-    if pd.notna(wknd_prev) and pd.notna(wknd_curr) and pd.notna(hprd_curr):
-        if wknd_curr < 0.8 * hprd_curr:
-            ev.append(_mk_event("staffing", "info",
-                                f"Weekend staffing is low vs weekday baseline: wknd {wknd_curr:.2f} vs overall {hprd_curr:.2f}",
-                                {"wknd": wknd_curr, "overall": hprd_curr}))
-
-    # Turnover increases ≥5 pp
-    for col, label in [("rn_turnover","RN turnover"), ("total_nurse_staff_turnover","Total nurse turnover"), ("administrator_turnover","Administrator turnover")]:
-        old = _get(r_prev, col)
-        new = _get(r_curr, col)
-        if pd.notna(old) and pd.notna(new) and (new - old) >= 0.05:
-            ev.append(_mk_event("staffing", "warn",
-                                f"{label} increased: {old:.2%} → {new:.2%}",
-                                {"from": float(old), "to": float(new)}))
-    return ev
-
-def diff_snf_qrp(prev: pd.DataFrame, curr: pd.DataFrame, ccn: str) -> List[Dict[str, Any]]:
-    ev = []
-    q_prev = prev[prev.get("ccn","").astype(str) == ccn] if not prev.empty else pd.DataFrame()
-    q_curr = curr[curr.get("ccn","").astype(str) == ccn] if not curr.empty else pd.DataFrame()
-    if q_curr.empty:
-        return ev
-
-    # Keep the latest row if there's an as_of_date or reporting_end
-    def pick_latest(df):
-        for c in ["as_of_date","reporting_period_end_date"]:
-            if c in df.columns:
-                return df.sort_values(c).iloc[-1]
-        return df.iloc[-1]
-
-    r_prev = pick_latest(q_prev) if not q_prev.empty else None
-    r_curr = pick_latest(q_curr)
-
-    # Common measure name guesses (schema varies)
-    MEAS = [
-        ("discharge_to_community_rate", "Discharge to Community (higher is better)", +1, 0.02),
-        ("potentially_preventable_30_day_post_discharge_readmission_rate", "Potentially Preventable Readmissions (lower is better)", -1, 0.02),
-        ("mspb_pac_snf_ratio", "MSPB-PAC (lower is better)", -1, 0.02),
-        ("hai_hospitalization_rate", "HAI requiring hospitalization (lower is better)", -1, 0.01),
-    ]
-
-    def safe_num(row, col):
-        if row is None:
-            return None
-        v = row.get(col, None)
-        try:
-            return float(v)
-        except Exception:
-            return None
-
-    for col, label, direction, thresh in MEAS:
-        if col in q_curr.columns:
-            old = safe_num(r_prev, col) if r_prev is not None else None
-            new = safe_num(r_curr, col)
-            if new is not None and (old is None or abs(new - old) >= thresh):
-                arrow = "↑" if (new > (old if old is not None else new)) else "↓"
-                worse = (direction == +1 and new < (old or new)) or (direction == -1 and new > (old or new))
-                sev = "warn" if old is not None and worse else "info"
-                msg = f"{label} changed: {old if old is not None else 'n/a'} → {new} ({arrow})"
-                ev.append(_mk_event("qrp", sev, msg, {"measure": col, "from": old, "to": new}))
-    return ev
-
-def diff_snf_vbp(prev: pd.DataFrame, curr: pd.DataFrame, ccn: str) -> List[Dict[str, Any]]:
-    ev = []
-    v_prev = prev[prev.get("ccn","").astype(str) == ccn] if not prev.empty else pd.DataFrame()
-    v_curr = curr[curr.get("ccn","").astype(str) == ccn] if not curr.empty else pd.DataFrame()
-    if v_curr.empty:
-        return ev
-
-    # If multiple fiscal years exist, keep the latest multiplier row (no standard date → use rank or presence)
-    def pick_latest(df):
-        if "fiscal_year" in df.columns:
-            try:
-                return df.sort_values("fiscal_year").iloc[-1]
-            except Exception:
-                pass
-        return df.iloc[-1]
-
-    r_prev = pick_latest(v_prev) if not v_prev.empty else None
-    r_curr = pick_latest(v_curr)
-
-    old = float(r_prev.get("incentive_payment_multiplier")) if (r_prev is not None and pd.notna(r_prev.get("incentive_payment_multiplier"))) else None
-    new = float(r_curr.get("incentive_payment_multiplier")) if pd.notna(r_curr.get("incentive_payment_multiplier")) else None
-
-    if new is not None and (old is None or abs(new - old) >= 0.005):
-        sev = "warn" if (old is not None and new < old) else "info"
-        msg = f"SNF VBP incentive multiplier: {old if old is not None else 'n/a'} → {new:.3f}"
-        ev.append(_mk_event("vbp", sev, msg, {"from": old, "to": new}))
-    return ev
-
-# -----------------------------
-# Orchestrate: pull → snapshot → diff → changelog
-# -----------------------------
-def build_changelogs(ccns: List[str], days_back: int = 60) -> Dict[str, Dict[str, Any]]:
-    since = (dt.date.today() - dt.timedelta(days=days_back)).isoformat()
-
-    # Pull current
-    penalties = fetch_penalties(ccns, since_iso=since)
-    deficiencies = fetch_deficiencies(ccns, since_iso=since)
-    provider = fetch_provider_info(ccns)
-    qrp = fetch_snf_qrp(ccns)
-    vbp = fetch_snf_vbp(ccns)
-
-    # Save current snapshot
-    snap_cur = {
-        "penalties": penalties,
-        "deficiencies": deficiencies,
-        "provider_info": provider,
-        "snf_qrp": qrp,
-        "snf_vbp": vbp
-    }
-    cur_dir = save_snapshot(snap_cur)
-
-    # Load previous snapshot (most recent before today)
-    prev_dir = latest_snapshot_dir(exclude_today=True)
-    prev = load_snapshot(prev_dir) if prev_dir else {"penalties": pd.DataFrame(), "deficiencies": pd.DataFrame(),
-                                                     "provider_info": pd.DataFrame(), "snf_qrp": pd.DataFrame(),
-                                                     "snf_vbp": pd.DataFrame()}
-
-    # Build changelogs
-    results: Dict[str, Dict[str, Any]] = {}
-    for ccn in ccns:
-        events = []
-        events += diff_penalties(prev.get("penalties", pd.DataFrame()), penalties, ccn)
-        events += diff_deficiencies(prev.get("deficiencies", pd.DataFrame()), deficiencies, ccn)
-        events += diff_provider_info(prev.get("provider_info", pd.DataFrame()), provider, ccn)
-        events += diff_snf_qrp(prev.get("snf_qrp", pd.DataFrame()), qrp, ccn)
-        events += diff_snf_vbp(prev.get("snf_vbp", pd.DataFrame()), vbp, ccn)
-
-        # Sort by perceived severity (high → warn → info)
-        sev_rank = {"high": 0, "warn": 1, "info": 2}
-        events.sort(key=lambda e: sev_rank.get(e["severity"], 9))
-
-        # Facility header bits (best-effort from Provider Info latest)
-        p = provider[provider.get("ccn","").astype(str) == ccn]
-        facility_name = None
-        city = state = None
-        if not p.empty:
-            # pick latest row by month_year if present
-            if "month_year" in p.columns:
-                p = p.sort_values("month_year").iloc[-1]
-            else:
-                p = p.iloc[-1]
-            facility_name = p.get("provider_name", None)
-            # address fields vary by release; try a few
-            city = p.get("city", p.get("provider_city", None))
-            state = p.get("state", p.get("provider_state", None))
-        header = {"ccn": ccn, "provider_name": facility_name, "city": city, "state": state}
-
-        results[ccn] = {"header": header, "events": events}
-
-    # Write per-CCN JSON
-    for ccn, payload in results.items():
-        out_fp = OUT_DIR / f"{ccn}.json"
-        with open(out_fp, "w") as f:
-            json.dump(payload, f, indent=2)
-    return results
-
-# -----------------------------
-# CLI
-# -----------------------------
-def main():
-    ap = argparse.ArgumentParser(description="CMS Post-Acute 'What's New' changelog generator")
-    ap.add_argument("--ccn", nargs="+", required=True, help="List of CCNs (e.g., 455682 675791 676336)")
-    ap.add_argument("--days", type=int, default=60, help="Look-back window for penalties/deficiencies (default 60)")
-    args = ap.parse_args()
-
-    # Normalize CCNs to 6 chars
-    ccns = [str(x).zfill(6) for x in args.ccn]
-    results = build_changelogs(ccns, days_back=args.days)
-
-    print("\n=== ChangeLog Summary ===")
-    for ccn, payload in results.items():
-        hdr = payload["header"]
-        print(f"\n{hdr.get('provider_name') or 'Facility'} (CCN {ccn}) – {hdr.get('city') or ''}, {hdr.get('state') or ''}")
-        if not payload["events"]:
-            print("  • No notable changes in the selected window.")
-        for e in payload["events"]:
-            print(f"  • [{e['severity'].upper()}] {e['message']}")
-
-if __name__ == "__main__":
-    main()
+print("\n=== Staffing stability signals (last 30 days) ===")
+for _, r in out.iterrows():
+    print(f"{r['ccn']}: {r.get('staffing_alerts','') or 'No flags'}")
