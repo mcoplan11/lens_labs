@@ -32,22 +32,39 @@ The tool monitors four key rating categories:
 
 1. Clone or download the repository
 
-2. Install dependencies:
+2. Create and activate a virtual environment (recommended):
+```bash
+python3 -m venv .venv
+source .venv/bin/activate  # On Windows: .venv\Scripts\activate
+```
+
+3. Install dependencies:
 ```bash
 pip install -r requirements.txt
 ```
 
-3. Make the script executable (optional):
+4. Make the script executable (optional):
 ```bash
 chmod +x track_cms_star_rating_change.py
 ```
 
+**Important**: Always activate your virtual environment before running the script:
+```bash
+source .venv/bin/activate  # On Windows: .venv\Scripts\activate
+```
+
 ## Quick Start
+
+**Before running, ensure your virtual environment is activated!**
 
 ### Basic Usage
 
 Track specific CCN numbers:
 ```bash
+# Activate venv first (if not already active)
+source .venv/bin/activate
+
+# Run the script
 python track_cms_star_rating_change.py --ccn 455682 675791 676336
 ```
 
@@ -224,27 +241,44 @@ Run daily at 8 AM:
 
 ## Troubleshooting
 
+### ModuleNotFoundError: No module named 'pandas' (or 'requests')
+**Solution**: Activate your virtual environment and install dependencies:
+```bash
+source .venv/bin/activate
+pip install -r requirements.txt
+```
+
+### 410 Client Error: Gone
+This error occurred with the old Socrata API. The script has been updated to use the new CMS CSV data source. Make sure you're using the latest version of the script.
+
 ### No data returned
-- Verify CCN numbers are correct
-- Check CMS API availability: https://data.cms.gov
-- Enable verbose logging with `-v` flag
+- Verify CCN numbers are correct (6-digit format)
+- Check CMS data availability: https://data.cms.gov/provider-data
+- Enable verbose logging with `-v` flag to see detailed information
+- The CSV file may be large (takes 30-60 seconds to download)
 
 ### Email not sending
 - Verify SMTP credentials in config file
 - Check if app passwords are required (Gmail, Outlook, etc.)
-- Review logs for specific error messages
+- Review logs for specific error messages in `cms_tracker.log`
 
-### Import errors
-- Ensure all dependencies are installed: `pip install -r requirements.txt`
-- Check Python version: `python --version` (must be 3.8+)
+### SSL Certificate errors
+If you see SSL certificate verification errors when downloading data:
+- Check your network proxy settings
+- Ensure your system time is correct
+- Try updating the `requests` package: `pip install --upgrade requests urllib3`
 
-## API Information
+## Data Source Information
 
 This tool uses the CMS Provider Information dataset:
-- **Endpoint**: https://data.cms.gov/resource/4pq5-n9py.json
-- **Documentation**: https://data.cms.gov
+- **Dataset ID**: 4pq5-n9py
+- **Data Format**: CSV (dynamically fetched from latest available)
+- **Metadata API**: https://data.cms.gov/provider-data/api/1/metastore/schemas/dataset/items/4pq5-n9py
+- **Documentation**: https://data.cms.gov/provider-data
 - **Data Source**: Centers for Medicare & Medicaid Services
-- **Update Frequency**: Monthly
+- **Update Frequency**: Monthly (typically around the 1st of each month)
+
+**Note**: CMS deprecated the old Socrata JSON API. This tool now automatically fetches the latest CSV file from CMS's metadata API, ensuring it always uses the most current data available.
 
 ## Contributing
 

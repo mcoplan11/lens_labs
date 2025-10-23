@@ -1,0 +1,18 @@
+2025-10-22 19:16:11,043 - INFO - Tracking 3 providers: 455682, 675791, 676336
+2025-10-22 19:16:11,044 - INFO - Fetching latest dataset metadata from CMS...
+2025-10-22 19:16:11,334 - INFO - Found CSV URL: https://data.cms.gov/provider-data/sites/default/files/resources/e923f267504f72a3b10c2daa39efed8a_1757685912/NH_ProviderInfo_Sep2025.csv
+2025-10-22 19:16:11,335 - INFO - Downloading provider data CSV...
+2025-10-22 19:16:13,203 - INFO - Downloaded CSV with 14752 total records
+2025-10-22 19:16:13,207 - INFO - Filtered to 3 records for tracked providers
+2025-10-22 19:16:13,212 - INFO - Normalized data: 3 valid records
+2025-10-22 19:16:13,215 - INFO - Saved 3 records to cms_rating_history.csv
+2025-10-22 19:16:13,215 - INFO - No rating changes detected
+2025-10-22 19:16:26,437 - INFO - Tracking 3 providers: 455682, 675791, 676336
+2025-10-22 19:16:26,438 - INFO - Fetching latest dataset metadata from CMS...
+2025-10-22 19:16:26,653 - INFO - Found CSV URL: https://data.cms.gov/provider-data/sites/default/files/resources/e923f267504f72a3b10c2daa39efed8a_1757685912/NH_ProviderInfo_Sep2025.csv
+2025-10-22 19:16:26,653 - INFO - Downloading provider data CSV...
+2025-10-22 19:16:28,253 - INFO - Downloaded CSV with 14752 total records
+2025-10-22 19:16:28,256 - INFO - Filtered to 3 records for tracked providers
+2025-10-22 19:16:28,258 - INFO - Normalized data: 3 valid records
+2025-10-22 19:16:28,269 - INFO - Saved 6 records to cms_rating_history.csv
+2025-10-22 19:16:28,274 - INFO - No rating changes detected

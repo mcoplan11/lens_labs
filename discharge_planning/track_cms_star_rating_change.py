@@ -62,7 +62,10 @@ class RatingChange:
 class CMSStarRatingTracker:
     """Tracks CMS star ratings for nursing homes."""
 
-    BASE_URL = "https://data.cms.gov/resource/4pq5-n9py.json"
+    # CMS now provides data as CSV files instead of Socrata API
+    DATASET_ID = "4pq5-n9py"
+    METADATA_URL = f"https://data.cms.gov/provider-data/api/1/metastore/schemas/dataset/items/{DATASET_ID}"
+
     RATING_FIELDS = [
         "overall_rating",
         "staffing_rating",
@@ -118,46 +121,85 @@ class CMSStarRatingTracker:
         session.mount("https://", adapter)
         return session
 
+    def _get_latest_csv_url(self) -> str:
+        """
+        Get the latest CSV download URL from CMS metadata API.
+
+        Returns:
+            URL to the latest CSV file
+
+        Raises:
+            requests.RequestException: If metadata request fails
+            ValueError: If no CSV URL found in metadata
+        """
+        try:
+            logger.info("Fetching latest dataset metadata from CMS...")
+            response = self.session.get(self.METADATA_URL, timeout=30)
+            response.raise_for_status()
+
+            metadata = response.json()
+
+            # Extract CSV download URL from distribution section
+            distributions = metadata.get("distribution", [])
+            for dist in distributions:
+                if dist.get("mediaType") == "text/csv":
+                    url = dist.get("downloadURL")
+                    if url:
+                        logger.info(f"Found CSV URL: {url}")
+                        return url
+
+            raise ValueError("No CSV download URL found in metadata")
+
+        except requests.RequestException as e:
+            logger.error(f"Failed to fetch metadata: {e}")
+            raise
+        except (ValueError, KeyError) as e:
+            logger.error(f"Failed to parse metadata: {e}")
+            raise
+
     def fetch_data(self) -> pd.DataFrame:
         """
-        Fetch rating data from CMS API.
+        Fetch rating data from CMS CSV file.
 
         Returns:
             DataFrame with provider rating data
 
         Raises:
-            requests.RequestException: If API request fails
+            requests.RequestException: If CSV download fails
         """
-        fields = [
-            "federal_provider_number",
-            "provider_name",
-            "city",
-            "state",
-            "month_year"
-        ] + self.RATING_FIELDS
-
-        params = {
-            "$select": ",".join(fields),
-            "$where": f"federal_provider_number in ({','.join([repr(c) for c in self.ccns])})",
-            "$limit": 50000,
-            "$order": "month_year DESC"
-        }
-
         try:
-            logger.info(f"Fetching data for {len(self.ccns)} providers from CMS API...")
-            response = self.session.get(self.BASE_URL, params=params, timeout=60)
+            # Get the latest CSV URL dynamically
+            csv_url = self._get_latest_csv_url()
+
+            logger.info(f"Downloading provider data CSV...")
+            response = self.session.get(csv_url, timeout=120)
             response.raise_for_status()
 
-            data = response.json()
-            if not data:
-                logger.warning("No data returned from CMS API")
+            # Read CSV directly from response content
+            from io import StringIO
+            df = pd.read_csv(StringIO(response.text), low_memory=False)
+
+            logger.info(f"Downloaded CSV with {len(df)} total records")
+
+            # Filter to only our CCNs
+            if df.empty:
+                logger.warning("No data in CSV file")
                 return pd.DataFrame()
 
-            logger.info(f"Retrieved {len(data)} records")
-            return pd.DataFrame(data)
+            # The CSV uses "CMS Certification Number (CCN)" as the provider number column
+            ccn_column = "CMS Certification Number (CCN)"
+            if ccn_column in df.columns:
+                df = df[df[ccn_column].astype(str).str.zfill(6).isin(self.ccns)]
+            else:
+                logger.error(f"Could not find provider number column in CSV. Available columns: {list(df.columns[:10])}...")
+                raise ValueError("Provider number column not found")
+
+            logger.info(f"Filtered to {len(df)} records for tracked providers")
+
+            return df
 
         except requests.RequestException as e:
-            logger.error(f"Failed to fetch data from CMS API: {e}")
+            logger.error(f"Failed to fetch data from CMS: {e}")
             raise
 
     def normalize_data(self, df: pd.DataFrame) -> pd.DataFrame:
@@ -165,7 +207,7 @@ class CMSStarRatingTracker:
         Normalize and clean the dataframe.
 
         Args:
-            df: Raw dataframe from API
+            df: Raw dataframe from CSV
 
         Returns:
             Cleaned dataframe with proper types
@@ -173,16 +215,53 @@ class CMSStarRatingTracker:
         if df.empty:
             return df
 
-        # Normalize CCN
-        df["ccn"] = df["federal_provider_number"].astype(str).str.zfill(6)
+        # Map CSV column names to our internal names
+        # Based on actual CMS CSV structure (as of 2025)
+        column_mapping = {
+            "CMS Certification Number (CCN)": "federal_provider_number",
+            "Provider Name": "provider_name",
+            "City/Town": "city",
+            "State": "state",
+            "Overall Rating": "overall_rating",
+            "Health Inspection Rating": "health_inspection_rating",
+            "QM Rating": "quality_measures_rating",
+            "Staffing Rating": "staffing_rating",
+            "Processing Date": "month_year"
+        }
 
-        # Parse dates
-        df["month_year"] = pd.to_datetime(df["month_year"], errors="coerce")
+        # Rename columns if they exist
+        rename_dict = {}
+        for old_name, new_name in column_mapping.items():
+            if old_name in df.columns:
+                rename_dict[old_name] = new_name
+
+        df = df.rename(columns=rename_dict)
+
+        # Normalize CCN
+        if "federal_provider_number" in df.columns:
+            df["ccn"] = df["federal_provider_number"].astype(str).str.zfill(6)
+        else:
+            logger.error("federal_provider_number column not found after mapping")
+            return pd.DataFrame()
+
+        # Parse dates - the CSV has a single processing date, not historical month_year
+        # We'll use processing date as the snapshot date
+        if "month_year" in df.columns:
+            df["month_year"] = pd.to_datetime(df["month_year"], errors="coerce")
+        else:
+            # If no date column, use current date
+            logger.warning("No date column found, using current date")
+            df["month_year"] = pd.Timestamp.now()
+
         df = df.dropna(subset=["month_year"])
 
         # Convert ratings to numeric
         for col in self.RATING_FIELDS:
-            df[col] = pd.to_numeric(df[col], errors="coerce")
+            if col in df.columns:
+                df[col] = pd.to_numeric(df[col], errors="coerce")
+            else:
+                logger.warning(f"Column {col} not found in data")
+                df[col] = pd.NA
 
         # Sort by CCN and date
         df = df.sort_values(["ccn", "month_year"])

@@ -1,0 +1,22 @@
+2025-10-22 18:59:12,934 - INFO - Tracking 3 providers: 455682, 675791, 676336
+2025-10-22 18:59:12,934 - INFO - Fetching data for 3 providers from CMS API...
+2025-10-22 18:59:13,565 - ERROR - Failed to fetch data from CMS API: 410 Client Error: Gone for url: https://data.cms.gov/resource/4pq5-n9py.json?%24select=federal_provider_number%2Cprovider_name%2Ccity%2Cstate%2Cmonth_year%2Coverall_rating%2Cstaffing_rating%2Cquality_measures_rating%2Chealth_inspection_rating&%24where=federal_provider_number+in+%28%27455682%27%2C%27675791%27%2C%27676336%27%29&%24limit=50000&%24order=month_year+DESC
+2025-10-22 18:59:13,565 - ERROR - Error running tracker: 410 Client Error: Gone for url: https://data.cms.gov/resource/4pq5-n9py.json?%24select=federal_provider_number%2Cprovider_name%2Ccity%2Cstate%2Cmonth_year%2Coverall_rating%2Cstaffing_rating%2Cquality_measures_rating%2Chealth_inspection_rating&%24where=federal_provider_number+in+%28%27455682%27%2C%27675791%27%2C%27676336%27%29&%24limit=50000&%24order=month_year+DESC
+2025-10-22 18:59:13,565 - ERROR - Fatal error: 410 Client Error: Gone for url: https://data.cms.gov/resource/4pq5-n9py.json?%24select=federal_provider_number%2Cprovider_name%2Ccity%2Cstate%2Cmonth_year%2Coverall_rating%2Cstaffing_rating%2Cquality_measures_rating%2Chealth_inspection_rating&%24where=federal_provider_number+in+%28%27455682%27%2C%27675791%27%2C%27676336%27%29&%24limit=50000&%24order=month_year+DESC
+2025-10-22 19:13:02,876 - INFO - Tracking 3 providers: 455682, 675791, 676336
+2025-10-22 19:13:02,876 - INFO - Fetching latest dataset metadata from CMS...
+2025-10-22 19:13:03,527 - INFO - Found CSV URL: https://data.cms.gov/provider-data/sites/default/files/resources/e923f267504f72a3b10c2daa39efed8a_1757685912/NH_ProviderInfo_Sep2025.csv
+2025-10-22 19:13:03,527 - INFO - Downloading provider data CSV...
+2025-10-22 19:13:05,858 - INFO - Downloaded CSV with 14752 total records
+2025-10-22 19:13:05,859 - ERROR - Could not find provider number column in CSV
+2025-10-22 19:13:05,859 - ERROR - Error running tracker: Provider number column not found
+2025-10-22 19:13:05,859 - ERROR - Fatal error: Provider number column not found
+2025-10-22 19:19:37,654 - INFO - Tracking 3 providers: 455682, 675791, 676336
+2025-10-22 19:19:37,654 - INFO - Fetching latest dataset metadata from CMS...
+2025-10-22 19:19:38,256 - INFO - Found CSV URL: https://data.cms.gov/provider-data/sites/default/files/resources/e923f267504f72a3b10c2daa39efed8a_1757685912/NH_ProviderInfo_Sep2025.csv
+2025-10-22 19:19:38,257 - INFO - Downloading provider data CSV...
+2025-10-22 19:19:40,735 - INFO - Downloaded CSV with 14752 total records
+2025-10-22 19:19:40,737 - INFO - Filtered to 3 records for tracked providers
+2025-10-22 19:19:40,740 - INFO - Normalized data: 3 valid records
+2025-10-22 19:19:40,742 - INFO - Saved 3 records to cms_rating_history.csv
+2025-10-22 19:19:40,742 - INFO - No rating changes detected
