@@ -11,10 +11,15 @@ from cms_api import CMSAPI
 
 # Page configuration
 st.set_page_config(
-    page_title="SNF Comparison Dashboard",
+    page_title="Compare SNF | Skilled Nursing Facility Comparison Tool - CMS Quality Ratings",
     page_icon="🏥",
     layout="wide",
-    initial_sidebar_state="expanded"
+    initial_sidebar_state="expanded",
+    menu_items={
+        'Get Help': 'https://data.cms.gov/provider-data',
+        'Report a bug': None,
+        'About': "Compare skilled nursing facilities using official CMS quality ratings. Free SNF comparison tool with star ratings, quality measures, and facility data."
+    }
 )
 
 # Custom CSS for better styling
@@ -116,8 +121,8 @@ def filter_dataframe(df, filters):
     return filtered_df
 
 # Header
-st.markdown('<h1 class="main-header">🏥 SNF Comparison Dashboard</h1>', unsafe_allow_html=True)
-st.markdown('<p class="sub-header">Compare Skilled Nursing Facilities with CMS Quality Data</p>', unsafe_allow_html=True)
+st.markdown('<h1 class="main-header">🏥 Compare SNF: Skilled Nursing Facility Comparison Tool</h1>', unsafe_allow_html=True)
+st.markdown('<p class="sub-header">Compare Skilled Nursing Facilities Using Official CMS Quality Ratings & Star Ratings | Free SNF Comparison Dashboard</p>', unsafe_allow_html=True)
 
 # Sidebar for search and filters
 st.sidebar.header("Search & Filters")
@@ -204,7 +209,7 @@ elif sort_option == "Fewest Beds":
 st.markdown(f"### Showing {len(filtered_df)} of {len(st.session_state.facilities_df)} facilities")
 
 # Tabs for different views
-tab1, tab2, tab3, tab4 = st.tabs(["📋 Facility Cards", "📊 Analytics", "🔍 Detailed View", "⚖️ Compare"])
+tab1, tab2, tab3, tab4, tab5, tab6 = st.tabs(["📋 Facility Cards", "🗺️ Map View", "📊 Analytics", "🔍 Detailed View", "⚖️ Compare", "ℹ️ About"])
 
 # Tab 1: Facility Cards
 with tab1:
@@ -264,8 +269,91 @@ with tab1:
 
                             st.markdown("---")
 
-# Tab 2: Analytics
+# Tab 2: Map View
 with tab2:
+    if not filtered_df.empty:
+        st.subheader("🗺️ Facility Map")
+
+        # Filter out facilities without coordinates
+        map_df = filtered_df.dropna(subset=['latitude', 'longitude'])
+
+        if map_df.empty:
+            st.warning("No facilities with valid coordinates to display on map.")
+        else:
+            # Add hover text
+            map_df['hover_text'] = map_df.apply(
+                lambda row: f"<b>{row['name']}</b><br>" +
+                           f"{row['city']}, {row['state']}<br>" +
+                           f"Overall Rating: {render_stars(row['overall_rating'])}<br>" +
+                           f"Beds: {row['bed_count']}<br>" +
+                           f"Ownership: {row['ownership']}",
+                axis=1
+            )
+
+            # Create color scale based on rating
+            map_df['rating_color'] = map_df['overall_rating'].map({
+                5: '#28A745',  # Green
+                4: '#90C351',  # Light green
+                3: '#FFC107',  # Yellow
+                2: '#FF8C42',  # Orange
+                1: '#DC3545',  # Red
+                0: '#6C757D'   # Gray
+            })
+
+            # Create the map
+            fig_map = px.scatter_mapbox(
+                map_df,
+                lat='latitude',
+                lon='longitude',
+                hover_name='name',
+                hover_data={
+                    'city': True,
+                    'state': True,
+                    'overall_rating': True,
+                    'bed_count': True,
+                    'ownership': True,
+                    'latitude': False,
+                    'longitude': False,
+                    'rating_color': False
+                },
+                color='overall_rating',
+                color_continuous_scale=[
+                    [0.0, '#DC3545'],  # 1 star - Red
+                    [0.25, '#FF8C42'], # 2 stars - Orange
+                    [0.5, '#FFC107'],  # 3 stars - Yellow
+                    [0.75, '#90C351'], # 4 stars - Light green
+                    [1.0, '#28A745']   # 5 stars - Green
+                ],
+                size_max=15,
+                zoom=3,
+                height=600,
+                labels={'overall_rating': 'Overall Rating'}
+            )
+
+            fig_map.update_layout(
+                mapbox_style="open-street-map",
+                margin={"r": 0, "t": 0, "l": 0, "b": 0}
+            )
+
+            st.plotly_chart(fig_map, use_container_width=True)
+
+            # Map statistics
+            col1, col2, col3, col4 = st.columns(4)
+            with col1:
+                st.metric("Facilities on Map", len(map_df))
+            with col2:
+                avg_rating = map_df['overall_rating'].mean()
+                st.metric("Average Rating", f"{avg_rating:.1f}⭐")
+            with col3:
+                top_rated = len(map_df[map_df['overall_rating'] >= 4])
+                st.metric("4+ Star Facilities", top_rated)
+            with col4:
+                st.metric("States Represented", map_df['state'].nunique())
+    else:
+        st.info("No facilities to display on map. Try adjusting your search or filters.")
+
+# Tab 3: Analytics
+with tab3:
     if not filtered_df.empty:
         st.subheader("Quality Ratings Distribution")
 
@@ -318,8 +406,8 @@ with tab2:
             avg_total_hours = filtered_df['total_hours_per_day'].mean()
             st.metric("Avg Total Nursing Hours/Day/Resident", f"{avg_total_hours:.2f}" if pd.notna(avg_total_hours) else "N/A")
 
-# Tab 3: Detailed View
-with tab3:
+# Tab 4: Detailed View
+with tab4:
     if 'selected_facility' in st.session_state:
         facility = st.session_state.selected_facility
 
@@ -377,8 +465,8 @@ with tab3:
     else:
         st.info("Select a facility from the 'Facility Cards' tab to view detailed information.")
 
-# Tab 4: Comparison
-with tab4:
+# Tab 5: Comparison
+with tab5:
     # Debug info
     st.write(f"**Debug:** Selected facility IDs: {st.session_state.selected_for_comparison}")
     st.write(f"**Debug:** Number selected: {len(st.session_state.selected_for_comparison)}")
@@ -441,6 +529,175 @@ with tab4:
     else:
         st.info("Select at least 2 facilities from the 'Facility Cards' tab to compare them.")
         st.write(f"Currently selected: {len(st.session_state.selected_for_comparison)} facilities")
+
+# Tab 6: About
+with tab6:
+    st.title("About This SNF Comparison Tool")
+
+    st.markdown("""
+    ## Compare Skilled Nursing Facilities (SNF) with Confidence
+
+    ### What is This Tool?
+
+    The **SNF Comparison Dashboard** is a free, comprehensive tool that helps you **compare skilled nursing facilities** using official CMS (Centers for Medicare & Medicaid Services) data. Whether you're searching for quality nursing homes for yourself, a loved one, or conducting healthcare research, our platform provides transparent, data-driven insights to make informed decisions.
+
+    ### Why Compare SNF Quality Ratings?
+
+    Choosing the right **skilled nursing facility** is one of the most important healthcare decisions you can make. Not all nursing homes provide the same level of care, and quality can vary significantly even within the same geographic area. Our SNF comparison tool helps you:
+
+    - **Identify top-rated nursing facilities** in your area based on CMS 5-star quality ratings
+    - **Compare nursing home quality measures** including health inspections, staffing levels, and patient outcomes
+    - **Make informed decisions** backed by official government data
+    - **Understand facility strengths and weaknesses** through detailed quality metrics
+    - **Visualize facility locations** on an interactive map
+
+    ### Key Features for Comparing SNF Facilities
+
+    #### 🔍 Advanced Search & Filtering
+    - Search by **state, city, ZIP code, or facility name**
+    - Filter by **star ratings** (1-5 stars based on CMS quality ratings)
+    - Filter by **ownership type** (for-profit, non-profit, government)
+    - Filter by **facility size** (bed count)
+    - Sort results by rating, name, or bed count
+
+    #### 🗺️ Interactive Map View
+    - Visualize nursing facilities on an interactive map
+    - Color-coded markers show quality ratings at a glance
+    - Click markers to view detailed facility information
+    - Compare multiple facilities in the same geographic area
+
+    #### 📊 Quality Metrics & Analytics
+    Our SNF comparison tool displays comprehensive quality measures including:
+
+    **Rating Categories:**
+    - Overall quality rating (1-5 stars)
+    - Health inspection rating
+    - Staffing rating
+    - Quality measures rating
+    - RN (Registered Nurse) staffing rating
+
+    **Patient Outcomes:**
+    - Falls with major injury rates
+    - Pressure ulcer (bedsore) rates
+    - Urinary tract infection (UTI) rates
+    - Antipsychotic medication usage rates
+
+    **Staffing Metrics:**
+    - RN hours per resident per day
+    - Total nursing hours per resident per day
+
+    **Compliance Data:**
+    - Health inspection deficiencies
+    - Fire safety deficiencies
+
+    #### ⚖️ Side-by-Side Comparison
+    - Compare up to 4 facilities simultaneously
+    - View all quality metrics in one comprehensive table
+    - Radar chart visualization for easy comparison
+    - Identify the best nursing home for your specific needs
+
+    ### How to Use This SNF Comparison Tool
+
+    **Step 1: Search for Facilities**
+    - Use the sidebar to enter your **state** or search term
+    - Apply filters to narrow down results based on ratings, ownership, or size
+
+    **Step 2: Review Facility Cards**
+    - Browse facilities in the **Facility Cards** tab
+    - View star ratings, bed counts, and key metrics at a glance
+    - Click "View Details" for comprehensive facility information
+
+    **Step 3: Explore the Map**
+    - Switch to the **Map View** tab to see facility locations
+    - Identify nursing homes near you or your loved one
+    - Use color-coded markers to spot top-rated facilities quickly
+
+    **Step 4: Analyze Quality Data**
+    - Visit the **Analytics** tab for distribution insights
+    - Understand industry benchmarks and averages
+    - Compare facility performance against regional norms
+
+    **Step 5: Compare Facilities**
+    - Select 2-4 facilities using the "Compare" button
+    - View side-by-side comparison in the **Compare** tab
+    - Make your final decision based on comprehensive data
+
+    ### Understanding CMS Star Ratings for Nursing Homes
+
+    The **CMS 5-star quality rating system** is the gold standard for evaluating skilled nursing facilities:
+
+    - ⭐⭐⭐⭐⭐ **5 Stars (Excellent)**: Well above average quality
+    - ⭐⭐⭐⭐ **4 Stars (Above Average)**: Better than average quality
+    - ⭐⭐⭐ **3 Stars (Average)**: Average quality
+    - ⭐⭐ **2 Stars (Below Average)**: Below average quality
+    - ⭐ **1 Star (Much Below Average)**: Much below average quality
+
+    The overall rating combines:
+    1. **Health Inspections** (50% weight) - Based on onsite surveys
+    2. **Staffing** (25% weight) - RN and total nurse staffing hours
+    3. **Quality Measures** (25% weight) - Patient health and safety outcomes
+
+    ### Who Should Use This SNF Comparison Tool?
+
+    Our platform is designed for:
+
+    - **Families** searching for quality care for elderly parents or relatives
+    - **Healthcare professionals** making referral recommendations
+    - **Hospital discharge planners** identifying appropriate post-acute care facilities
+    - **Researchers** analyzing nursing home quality trends
+    - **Advocates** working to improve long-term care quality
+    - **Anyone** seeking to compare skilled nursing facilities objectively
+
+    ### Data Source & Accuracy
+
+    All data is sourced directly from the **CMS Provider Data Catalog**, which includes:
+    - Official nursing home quality ratings
+    - Quarterly updated inspection results
+    - Verified staffing information
+    - Patient health outcome measures
+
+    Data is refreshed regularly to ensure you have access to the most current information when comparing SNF facilities.
+
+    ### Frequently Asked Questions About SNF Comparison
+
+    **Q: What's the difference between a nursing home and a skilled nursing facility?**
+    A: "Skilled nursing facility" (SNF) and "nursing home" are often used interchangeably. SNFs provide 24-hour nursing care and medical services for patients who require ongoing medical attention.
+
+    **Q: How often are CMS ratings updated?**
+    A: CMS updates nursing home ratings monthly based on the most recent inspection and quality data.
+
+    **Q: Should I only consider 5-star facilities?**
+    A: Not necessarily. While higher ratings indicate better performance, consider location, specialized services, and personal preferences. A 4-star facility closer to family may be better than a 5-star facility far away.
+
+    **Q: Are all nursing homes in the database?**
+    A: Our tool includes all Medicare and Medicaid certified skilled nursing facilities in the United States - over 15,000 facilities nationwide.
+
+    **Q: Is this tool free to use?**
+    A: Yes! This SNF comparison tool is completely free and requires no registration.
+
+    ### Next Steps in Your SNF Search
+
+    After comparing skilled nursing facilities online:
+
+    1. **Schedule tours** at your top 2-3 choices
+    2. **Ask questions** about care plans, staffing ratios, and family involvement
+    3. **Meet the staff** who will be providing care
+    4. **Review contracts carefully** before making commitments
+    5. **Trust your instincts** - data is important, but so is your personal impression
+
+    ### Privacy & Disclaimer
+
+    This tool displays publicly available CMS data. We do not collect personal information. This tool is for informational purposes only and should not replace professional medical advice or personal facility visits when selecting a nursing home.
+
+    ---
+
+    ### Keywords for Healthcare Seekers
+
+    *Compare skilled nursing facilities, SNF comparison tool, nursing home ratings, CMS 5-star ratings, skilled nursing facility quality, compare nursing homes, SNF quality ratings, nursing facility comparison, Medicare nursing homes, find skilled nursing facilities, nursing home quality data, SNF star ratings, compare SNF care, skilled nursing facility search, nursing home quality comparison*
+    """)
+
+    st.markdown("---")
+    st.info("💡 **Ready to compare SNF facilities?** Click on the **Facility Cards** or **Map View** tab to start exploring quality nursing homes in your area!")
 
 # Footer
 st.markdown("---")
